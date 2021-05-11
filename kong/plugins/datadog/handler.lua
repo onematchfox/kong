@@ -1,103 +1,66 @@
-local basic_serializer = require "kong.plugins.log-serializers.basic"
-local statsd_logger    = require "kong.plugins.datadog.statsd_logger"
+local statsd_logger = require "kong.plugins.datadog.statsd_logger"
 
-
-local ngx_log       = ngx.log
-local ngx_timer_at  = ngx.timer.at
-local string_gsub   = string.gsub
-local pairs         = pairs
-local string_format = string.format
-local NGX_ERR       = ngx.ERR
-
-
-local DatadogHandler    = {}
-DatadogHandler.PRIORITY = 10
-DatadogHandler.VERSION = "2.0.0"
+local kong     = kong
+local ngx      = ngx
+local timer_at = ngx.timer.at
+local insert   = table.insert
+local gsub     = string.gsub
+local pairs    = pairs
 
 
 local get_consumer_id = {
   consumer_id = function(consumer)
-    return consumer and string_gsub(consumer.id, "-", "_")
+    return consumer and gsub(consumer.id, "-", "_")
   end,
-  custom_id   = function(consumer)
+  custom_id = function(consumer)
     return consumer and consumer.custom_id
   end,
-  username    = function(consumer)
+  username = function(consumer)
     return consumer and consumer.username
   end
 }
 
 
-local metrics = {
-  status_count = function (service_name, message, metric_config, logger)
-    local fmt = string_format("%s.request.status", service_name,
-                       message.response.status)
-
-    logger:send_statsd(string_format("%s.%s", fmt, message.response.status),
-                       1, logger.stat_types.counter,
-                       metric_config.sample_rate, metric_config.tags)
-
-    logger:send_statsd(string_format("%s.%s", fmt, "total"), 1,
-                       logger.stat_types.counter,
-                       metric_config.sample_rate, metric_config.tags)
-  end,
-  unique_users = function (service_name, message, metric_config, logger)
-    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
-    local consumer_id     = get_consumer_id(message.consumer)
-
-    if consumer_id then
-      local stat = string_format("%s.user.uniques", service_name)
-
-      logger:send_statsd(stat, consumer_id, logger.stat_types.set,
-                         nil, metric_config.tags)
+local function compose_tags(service_name_tag, service_name, status, consumer_id, tags, ctx_tags)
+  local result = {
+    service_name_tag..":"..service_name,
+    "status:"..status,
+  }
+  if consumer_id ~= nil then
+    insert(result, "consumer:" ..consumer_id)
+  end
+  if tags ~= nil then
+    for _, v in pairs(tags) do
+      insert(result, v)
     end
-  end,
-  request_per_user = function (service_name, message, metric_config, logger)
-    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
-    local consumer_id     = get_consumer_id(message.consumer)
-
-    if consumer_id then
-      local stat = string_format("%s.user.%s.request.count", service_name, consumer_id)
-
-      logger:send_statsd(stat, 1, logger.stat_types.counter,
-                         metric_config.sample_rate, metric_config.tags)
+  end
+  if ctx_tags ~= nil then
+    for k, v in pairs(ctx_tags) do
+      if type(v) ~= 'table' then
+        insert(result, k..":"..v)
+      end
     end
-  end,
-  status_count_per_user = function (service_name, message, metric_config, logger)
-    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
-    local consumer_id     = get_consumer_id(message.consumer)
-
-    if consumer_id then
-      local fmt = string_format("%s.user.%s.request.status", service_name, consumer_id)
-
-      logger:send_statsd(string_format("%s.%s", fmt, message.response.status),
-                         1, logger.stat_types.counter,
-                         metric_config.sample_rate, metric_config.tags)
-
-      logger:send_statsd(string_format("%s.%s", fmt,  "total"),
-                         1, logger.stat_types.counter,
-                         metric_config.sample_rate, metric_config.tags)
-    end
-  end,
-}
+  end
+  return result
+end
 
 
-local function log(premature, conf, message)
+local function log(premature, conf, message, ctx_tags)
   if premature then
     return
   end
 
-  local name = string_gsub(message.service.name ~= ngx.null and
-                           message.service.name or message.service.host,
-                           "%.", "_")
+  local name = gsub(message.service.name ~= ngx.null and
+                    message.service.name or message.service.host,
+                    "%.", "_")
 
   local stat_name  = {
-    request_size     = name .. ".request.size",
-    response_size    = name .. ".response.size",
-    latency          = name .. ".latency",
-    upstream_latency = name .. ".upstream_latency",
-    kong_latency     = name .. ".kong_latency",
-    request_count    = name .. ".request.count",
+    request_size     = "request.size",
+    response_size    = "response.size",
+    latency          = "latency",
+    upstream_latency = "upstream_latency",
+    kong_latency     = "kong_latency",
+    request_count    = "request.count",
   }
   local stat_value = {
     request_size     = message.request.size,
@@ -110,28 +73,31 @@ local function log(premature, conf, message)
 
   local logger, err = statsd_logger:new(conf)
   if err then
-    ngx_log(NGX_ERR, "failed to create Statsd logger: ", err)
+    kong.log.err("failed to create Statsd logger: ", err)
     return
   end
 
   for _, metric_config in pairs(conf.metrics) do
-    local metric = metrics[metric_config.name]
+    local stat_name       = stat_name[metric_config.name]
+    local stat_value      = stat_value[metric_config.name]
+    local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
+    local consumer_id     = get_consumer_id and get_consumer_id(message.consumer) or nil
+    local tags            = compose_tags(conf.service_name_tag, name, message.response.status, consumer_id, metric_config.tags, ctx_tags)
 
-    if metric then
-      metric(name, message, metric_config, logger)
-
-    else
-      local stat_name  = stat_name[metric_config.name]
-      local stat_value = stat_value[metric_config.name]
-
+    if stat_name ~= nil then
       logger:send_statsd(stat_name, stat_value,
                          logger.stat_types[metric_config.stat_type],
-                         metric_config.sample_rate, metric_config.tags)
+                         metric_config.sample_rate, tags)
     end
   end
-
   logger:close_socket()
 end
+
+
+local DatadogHandler = {
+  PRIORITY = 10,
+  VERSION = "3.0.2",
+}
 
 
 function DatadogHandler:log(conf)
@@ -139,12 +105,13 @@ function DatadogHandler:log(conf)
     return
   end
 
-  local message = basic_serializer.serialize(ngx)
-
-  local ok, err = ngx_timer_at(0, log, conf, message)
+  local message = kong.log.serialize()
+  local datadog_tags = kong.ctx.shared.datadog_tags
+  local ok, err = timer_at(0, log, conf, message, datadog_tags)
   if not ok then
-    ngx_log(NGX_ERR, "failed to create timer: ", err)
+    kong.log.err("failed to create timer: ", err)
   end
 end
+
 
 return DatadogHandler
