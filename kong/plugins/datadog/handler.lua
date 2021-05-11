@@ -1,6 +1,5 @@
 local statsd_logger = require "kong.plugins.datadog.statsd_logger"
 
-
 local kong     = kong
 local ngx      = ngx
 local timer_at = ngx.timer.at
@@ -22,8 +21,11 @@ local get_consumer_id = {
 }
 
 
-local function compose_tags(service_name, status, consumer_id, tags)
-  local result = {"name:" ..service_name, "status:"..status}
+local function compose_tags(service_name_tag, service_name, status, consumer_id, tags, ctx_tags)
+  local result = {
+    service_name_tag..":"..service_name,
+    "status:"..status,
+  }
   if consumer_id ~= nil then
     insert(result, "consumer:" ..consumer_id)
   end
@@ -32,11 +34,18 @@ local function compose_tags(service_name, status, consumer_id, tags)
       insert(result, v)
     end
   end
+  if ctx_tags ~= nil then
+    for k, v in pairs(ctx_tags) do
+      if type(v) ~= 'table' then
+        insert(result, k..":"..v)
+      end
+    end
+  end
   return result
 end
 
 
-local function log(premature, conf, message)
+local function log(premature, conf, message, ctx_tags)
   if premature then
     return
   end
@@ -54,8 +63,8 @@ local function log(premature, conf, message)
     request_count    = "request.count",
   }
   local stat_value = {
-    request_size     = message.request and message.request.size,
-    response_size    = message.response and message.response.size,
+    request_size     = message.request.size,
+    response_size    = message.response.size,
     latency          = message.latencies.request,
     upstream_latency = message.latencies.proxy,
     kong_latency     = message.latencies.kong,
@@ -73,9 +82,7 @@ local function log(premature, conf, message)
     local stat_value      = stat_value[metric_config.name]
     local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
     local consumer_id     = get_consumer_id and get_consumer_id(message.consumer) or nil
-    local tags            = compose_tags(
-            name, message.response and message.response.status or "-",
-            consumer_id, metric_config.tags)
+    local tags            = compose_tags(conf.service_name_tag, name, message.response.status, consumer_id, metric_config.tags, ctx_tags)
 
     if stat_name ~= nil then
       logger:send_statsd(stat_name, stat_value,
@@ -89,7 +96,7 @@ end
 
 local DatadogHandler = {
   PRIORITY = 10,
-  VERSION = "3.0.1",
+  VERSION = "3.0.2",
 }
 
 
@@ -99,7 +106,8 @@ function DatadogHandler:log(conf)
   end
 
   local message = kong.log.serialize()
-  local ok, err = timer_at(0, log, conf, message)
+  local datadog_tags = kong.ctx.shared.datadog_tags
+  local ok, err = timer_at(0, log, conf, message, datadog_tags)
   if not ok then
     kong.log.err("failed to create timer: ", err)
   end

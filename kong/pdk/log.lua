@@ -15,6 +15,7 @@ local ngx_re = require "ngx.re"
 local inspect = require "inspect"
 local ngx_ssl = require "ngx.ssl"
 local phase_checker = require "kong.pdk.private.phases"
+local to_hex = require "resty.string".to_hex
 local utils = require "kong.tools.utils"
 
 
@@ -318,7 +319,8 @@ local function gen_log_func(lvl_const, imm_buf, to_string, stack_level, sep)
       end
     end
 
-    local msg = concat(variadic_buf, sep, 1, n)
+    local trace_id = ngx.ctx and ngx.ctx.trace_context and to_hex(ngx.ctx.trace_context.trace_id) or "---"
+    local msg = trace_id..": "..concat(variadic_buf, sep, 1, n)
 
     for i = 1, imm_buf.n_messages do
       imm_buf[imm_buf.message_idxs[i]] = msg

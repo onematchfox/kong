@@ -538,6 +538,19 @@ local function new(self, major_version)
       error("headers have already been sent", 2)
     end
 
+    if self.ctx.core.phase ~= phase_checker.phases.admin_api and ngx.config.subsystem == "http" and status >= 400 then
+      if type(body) == "string" then
+        body = {
+          message = body
+        }
+      end
+      -- `kong.ctx.shared.user_details` is set by the `revolution` plugin if active.
+      ngx.ctx.user_details = kong.ctx.shared.user_details
+      ngx.ctx.error_body = body
+      ngx.ctx.error_headers = headers
+      return ngx.exit(status)
+    end
+
     ngx.status = status
 
     local has_content_type
@@ -771,7 +784,7 @@ local function new(self, major_version)
     --
     -- -- In L4 proxy mode
     -- return kong.response.exit(200, "Success")
-    -- 
+    --
     function _RESPONSE.exit(status, body, headers)
       if self.worker_events and ngx.get_phase() == "content" then
         self.worker_events.poll()
@@ -1004,7 +1017,12 @@ local function new(self, major_version)
       local actual_message = message or
                              HTTP_MESSAGES["s" .. status] or
                              fmt(HTTP_MESSAGES.default, status)
-      body = fmt(utils.get_error_template(content_type), actual_message)
+      -- PATCH: Don't actually set this to HTML now - we want our own HTML
+      -- and we want it applied globally so we need patch `send()` instead as
+      -- not everything calls `kong.response.error`
+      body = {
+        message = actual_message
+      } -- fmt(utils.get_error_template(content_type), actual_message)
     end
 
     local ctx = ngx.ctx
